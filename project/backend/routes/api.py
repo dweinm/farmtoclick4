@@ -13,12 +13,94 @@ from db import get_mongodb_db
 from middleware import token_required
 from helpers import allowed_file, MAX_FILE_SIZE, send_system_email, build_email_html, generate_receipt_pdf
 from lalamove import create_delivery_order, get_delivery_status
+from paymongo import create_checkout_session, PayMongoError, verify_webhook_signature
 
 api_bp = Blueprint('api', __name__, url_prefix='/api')
 
 _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # routes/ -> backend/
 UPLOAD_FOLDER = os.path.join(_BACKEND_DIR, 'static', 'uploads', 'profiles')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+
+def _get_paymongo_redirect_urls():
+    origin = (request.headers.get('Origin') or '').rstrip('/')
+    success_url = (os.environ.get('PAYMONGO_SUCCESS_URL') or '').strip()
+    cancel_url = (os.environ.get('PAYMONGO_CANCEL_URL') or '').strip()
+
+    if not success_url and origin:
+        success_url = f'{origin}/orders'
+    if not cancel_url and origin:
+        cancel_url = f'{origin}/cart'
+
+    return success_url, cancel_url
+
+
+def _finalize_paid_order(db, order_doc):
+    from bson import ObjectId
+
+    items = order_doc.get('items', [])
+    for item in items:
+        product_id = item.get('product_id')
+        qty = int(item.get('quantity', 1))
+        if not product_id:
+            continue
+        try:
+            if ObjectId.is_valid(str(product_id)):
+                db.products.update_one({'_id': ObjectId(str(product_id))}, {'$inc': {'quantity': -qty}})
+            else:
+                db.products.update_one({'id': str(product_id)}, {'$inc': {'quantity': -qty}})
+        except Exception:
+            pass
+
+    try:
+        product_ids = [str(item.get('product_id')) for item in items if item.get('product_id')]
+        if product_ids:
+            db.carts.update_one(
+                {'user_id': order_doc.get('user_id')},
+                {'$pull': {'items': {'product_id': {'$in': product_ids}}}},
+            )
+    except Exception:
+        pass
+
+    try:
+        user_doc = db.users.find_one({'id': order_doc.get('user_id')})
+        if not user_doc:
+            user_doc = db.users.find_one({'_id': order_doc.get('user_id')})
+
+        buyer_email = user_doc.get('email') if user_doc else None
+        shipping_name = order_doc.get('shipping_name') or (user_doc.get('first_name') if user_doc else '')
+        order_id = str(order_doc.get('_id'))
+        total_amount = float(order_doc.get('total_amount', 0) or 0)
+
+        if buyer_email:
+            receipt_pdf = generate_receipt_pdf(order_id, shipping_name, buyer_email, items, total_amount)
+            email_html = build_email_html(
+                title="Payment Confirmed",
+                subtitle="Your payment was received",
+                badge_text="PAID",
+                content_html=(
+                    f"<p>Hi {shipping_name},</p>"
+                    "<p>Your payment has been confirmed and your order is now pending seller approval.</p>"
+                    f'<div style="background:#f3f4f6;padding:12px 14px;border-radius:10px;">'
+                    f"<strong>Order ID:</strong> {order_id}</div>"
+                    "<p style='margin-top:12px;'>Thank you for shopping with FarmtoClick.</p>"
+                ),
+            )
+            send_system_email(
+                current_app,
+                buyer_email,
+                "FarmtoClick Payment Confirmed",
+                f"Order ID: {order_id}\nTotal: {total_amount}",
+                html_body=email_html,
+                attachments=[{
+                    'filename': f"FarmtoClick-Receipt-{order_id}.pdf",
+                    'content': receipt_pdf,
+                    'maintype': 'application',
+                    'subtype': 'pdf',
+                }],
+            )
+    except Exception as e:
+        print(f"Payment confirmation email error: {e}")
 
 
 # ------------------------------------------------------------------
@@ -569,9 +651,10 @@ def api_create_order():
         shipping_name = (data.get('shipping_name') or '').strip()
         shipping_phone = (data.get('shipping_phone') or '').strip()
         shipping_address = (data.get('shipping_address') or '').strip()
-        payment_method = (data.get('payment_method') or '').strip()
+        payment_method_raw = (data.get('payment_method') or '').strip()
+        payment_method = payment_method_raw.lower()
 
-        if not all([shipping_name, shipping_phone, shipping_address, payment_method]):
+        if not all([shipping_name, shipping_phone, shipping_address, payment_method_raw]):
             return jsonify({'error': 'Please fill out all shipping details and payment method'}), 400
 
         db, _ = get_mongodb_db(api_bp)
@@ -582,6 +665,7 @@ def api_create_order():
         if not cart_doc or not cart_doc.get('items'):
             return jsonify({'error': 'Your cart is empty'}), 400
 
+        is_mobile_money = payment_method == 'mobile'
         order_items = []
         total_amount = 0.0
 
@@ -610,10 +694,11 @@ def api_create_order():
             })
             total_amount += price * qty
 
-            try:
-                db.products.update_one({'_id': product_data.get('_id')}, {'$inc': {'quantity': -qty}})
-            except Exception:
-                pass
+            if not is_mobile_money:
+                try:
+                    db.products.update_one({'_id': product_data.get('_id')}, {'$inc': {'quantity': -qty}})
+                except Exception:
+                    pass
 
         if not order_items:
             return jsonify({'error': 'Unable to place order. Please try again.'}), 400
@@ -630,7 +715,10 @@ def api_create_order():
             'shipping_name': shipping_name,
             'shipping_phone': shipping_phone,
             'shipping_address': shipping_address,
-            'payment_method': payment_method,
+            'payment_method': payment_method_raw,
+            'payment_status': 'pending' if is_mobile_money else 'unpaid',
+            'payment_provider': 'paymongo' if is_mobile_money else None,
+            'payment_channel': 'gcash' if is_mobile_money else None,
             'created_at': datetime.utcnow(),
             'updated_at': datetime.utcnow(),
         }
@@ -639,41 +727,160 @@ def api_create_order():
         order_id = str(order_result.inserted_id)
         order_doc['_id'] = order_id
 
-        # Send receipt email
-        try:
-            receipt_pdf = generate_receipt_pdf(order_id, shipping_name, request.user_email, order_items, total_amount)
-            email_html = build_email_html(
-                title="Order Confirmed",
-                subtitle="Your order is pending seller approval",
-                badge_text="PENDING APPROVAL",
-                content_html=(
-                    f"<p>Hi {shipping_name},</p>"
-                    "<p>Your order has been confirmed and is pending seller approval.</p>"
-                    f'<div style="background:#f3f4f6;padding:12px 14px;border-radius:10px;">'
-                    f"<strong>Order ID:</strong> {order_id}</div>"
-                    "<p style='margin-top:12px;'>We will email you again once the seller approves your order.</p>"
-                    "<p>Thank you for shopping with FarmtoClick.</p>"
-                ),
-            )
-            send_system_email(
-                current_app,
-                request.user_email,
-                "FarmtoClick Order Confirmed - Pending Approval",
-                f"Order ID: {order_id}\nTotal: {total_amount}",
-                html_body=email_html,
-                attachments=[{
-                    'filename': f"FarmtoClick-Receipt-{order_id}.pdf",
-                    'content': receipt_pdf,
-                    'maintype': 'application',
-                    'subtype': 'pdf',
-                }],
-            )
-        except Exception as e:
-            print(f"Order confirmation email error: {e}")
+        if not is_mobile_money:
+            try:
+                receipt_pdf = generate_receipt_pdf(order_id, shipping_name, request.user_email, order_items, total_amount)
+                email_html = build_email_html(
+                    title="Order Confirmed",
+                    subtitle="Your order is pending seller approval",
+                    badge_text="PENDING APPROVAL",
+                    content_html=(
+                        f"<p>Hi {shipping_name},</p>"
+                        "<p>Your order has been confirmed and is pending seller approval.</p>"
+                        f'<div style="background:#f3f4f6;padding:12px 14px;border-radius:10px;">'
+                        f"<strong>Order ID:</strong> {order_id}</div>"
+                        "<p style='margin-top:12px;'>We will email you again once the seller approves your order.</p>"
+                        "<p>Thank you for shopping with FarmtoClick.</p>"
+                    ),
+                )
+                send_system_email(
+                    current_app,
+                    request.user_email,
+                    "FarmtoClick Order Confirmed - Pending Approval",
+                    f"Order ID: {order_id}\nTotal: {total_amount}",
+                    html_body=email_html,
+                    attachments=[{
+                        'filename': f"FarmtoClick-Receipt-{order_id}.pdf",
+                        'content': receipt_pdf,
+                        'maintype': 'application',
+                        'subtype': 'pdf',
+                    }],
+                )
+            except Exception as e:
+                print(f"Order confirmation email error: {e}")
 
-        db.carts.delete_one({'_id': cart_doc['_id']})
+            db.carts.delete_one({'_id': cart_doc['_id']})
+
+        if is_mobile_money:
+            success_url, cancel_url = _get_paymongo_redirect_urls()
+            if not success_url or not cancel_url:
+                return jsonify({'error': 'PayMongo redirect URLs are not configured'}), 500
+
+            try:
+                line_items = [
+                    {
+                        'name': item.get('name', 'Item'),
+                        'quantity': int(item.get('quantity', 1)),
+                        'amount': int(round(float(item.get('price', 0) or 0) * 100)),
+                        'currency': 'PHP',
+                    }
+                    for item in order_items
+                ]
+                checkout = create_checkout_session(
+                    amount=int(round(total_amount * 100)),
+                    description=f'FarmtoClick Order {order_id}',
+                    success_url=success_url,
+                    cancel_url=cancel_url,
+                    payment_method_types=['gcash', 'qrph'],
+                    line_items=line_items,
+                    metadata={'order_id': order_id, 'user_id': request.user_id},
+                    reference_number=str(order_id),
+                )
+                db.orders.update_one(
+                    {'_id': order_result.inserted_id},
+                    {'$set': {
+                        'paymongo_checkout_id': checkout['id'],
+                        'paymongo_checkout_url': checkout['checkout_url'],
+                        'payment_status': 'pending',
+                        'payment_provider': 'paymongo',
+                        'updated_at': datetime.utcnow(),
+                    }},
+                )
+                order_doc['paymongo_checkout_id'] = checkout['id']
+                order_doc['paymongo_checkout_url'] = checkout['checkout_url']
+                return jsonify({
+                    'message': 'Checkout session created',
+                    'checkout_url': checkout['checkout_url'],
+                    'order': order_doc,
+                }), 201
+            except PayMongoError as exc:
+                db.orders.update_one(
+                    {'_id': order_result.inserted_id},
+                    {'$set': {
+                        'payment_status': 'failed',
+                        'payment_error': str(exc),
+                        'updated_at': datetime.utcnow(),
+                    }},
+                )
+                print(f"PayMongo checkout error: {exc}")
+                return jsonify({
+                    'error': 'Unable to initialize mobile money payment',
+                    'details': str(exc),
+                }), 502
 
         return jsonify({'message': 'Order placed successfully', 'order': order_doc}), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/paymongo/webhook', methods=['POST'])
+def api_paymongo_webhook():
+    try:
+        payload_raw = request.get_data() or b''
+        signature_header = (
+            request.headers.get('Paymongo-Signature')
+            or request.headers.get('PayMongo-Signature')
+            or request.headers.get('paymongo-signature')
+            or ''
+        )
+        try:
+            if not verify_webhook_signature(payload_raw, signature_header):
+                return jsonify({'error': 'Invalid signature'}), 401
+        except PayMongoError:
+            return jsonify({'error': 'Webhook secret not configured'}), 401
+
+        payload = request.get_json(silent=True) or {}
+        event = payload.get('data', {}).get('attributes', {})
+        event_type = (event.get('type') or '').lower()
+
+        data_payload = event.get('data', {})
+        data_attrs = data_payload.get('attributes', {})
+
+        metadata = {}
+        if isinstance(data_attrs.get('metadata'), dict):
+            metadata = data_attrs.get('metadata')
+        elif isinstance(data_attrs.get('source', {}), dict):
+            metadata = data_attrs.get('source', {}).get('metadata', {}) or {}
+
+        order_id = metadata.get('order_id') or metadata.get('orderId')
+        if not order_id:
+            return jsonify({'received': True}), 200
+
+        db, _ = get_mongodb_db(api_bp)
+        if db is None:
+            return jsonify({'error': 'Database connection failed'}), 500
+
+        from bson import ObjectId
+        order_filter = {'_id': ObjectId(order_id)} if ObjectId.is_valid(str(order_id)) else {'_id': order_id}
+        order_doc = db.orders.find_one(order_filter)
+        if not order_doc:
+            return jsonify({'received': True}), 200
+
+        update_fields = {'updated_at': datetime.utcnow()}
+        if event_type == 'payment.paid':
+            if order_doc.get('payment_status') == 'paid':
+                return jsonify({'received': True}), 200
+            update_fields['payment_status'] = 'paid'
+            update_fields['paymongo_payment_id'] = data_payload.get('id')
+            update_fields['paid_at'] = datetime.utcnow()
+            db.orders.update_one(order_filter, {'$set': update_fields})
+            _finalize_paid_order(db, order_doc)
+        elif event_type in ('payment.failed', 'payment.expired', 'checkout_session.payment.failed'):
+            update_fields['payment_status'] = 'failed'
+            update_fields['payment_failed_at'] = datetime.utcnow()
+            db.orders.update_one(order_filter, {'$set': update_fields})
+
+        return jsonify({'received': True}), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -712,6 +919,8 @@ def api_farmer_orders():
             return doc
 
         for order_doc in db.orders.find().sort('created_at', -1):
+            if order_doc.get('payment_provider') == 'paymongo' and order_doc.get('payment_status') != 'paid':
+                continue
             order_items = []
             for item in order_doc.get('items', []):
                 pdoc = _get_product(item.get('product_id'))
@@ -776,6 +985,9 @@ def api_update_order_status(order_id):
             order_doc = db.orders.find_one({'_id': ObjectId(order_id)})
         if not order_doc:
             return jsonify({'success': False, 'message': 'Order not found'}), 404
+
+        if order_doc.get('payment_provider') == 'paymongo' and order_doc.get('payment_status') != 'paid':
+            return jsonify({'success': False, 'message': 'Payment not confirmed'}), 400
 
         farmer_id = str(user.id)
 

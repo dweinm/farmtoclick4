@@ -64,12 +64,17 @@ const Cart = () => {
     }
     setIsSubmitting(true);
     try {
-      await cartAPI.checkout({
+      const response = await cartAPI.checkout({
         shipping_name: `${user.first_name} ${user.last_name}`,
         shipping_phone: user.phone,
         shipping_address: user.shipping_address,
         payment_method: paymentMethod,
       });
+      const checkoutUrl = response?.data?.checkout_url;
+      if (checkoutUrl) {
+        window.location.href = checkoutUrl;
+        return;
+      }
       setFlashMessages([{ category: 'success', text: 'Order placed successfully! Redirecting...' }]);
       setTimeout(() => navigate('/orders'), 2000);
     } catch (error) {

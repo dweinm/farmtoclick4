@@ -11,8 +11,16 @@ from flask_login import login_required, current_user
 from db import get_mongodb_db, ensure_mongoengine_user
 from helpers import send_system_email, build_email_html, generate_receipt_pdf
 from lalamove import create_delivery_order
+from paymongo import create_checkout_session, PayMongoError
 
 orders_bp = Blueprint('orders', __name__)
+
+
+def _get_paymongo_redirect_urls():
+    base_url = request.host_url.rstrip('/')
+    success_url = (os.environ.get('PAYMONGO_SUCCESS_URL') or '').strip() or f'{base_url}/orders'
+    cancel_url = (os.environ.get('PAYMONGO_CANCEL_URL') or '').strip() or f'{base_url}/cart'
+    return success_url, cancel_url
 
 
 @orders_bp.route('/orders')
@@ -61,6 +69,7 @@ def checkout():
         shipping_phone = request.form.get('shipping_phone', '').strip()
         shipping_address = request.form.get('shipping_address', '').strip()
         payment_method = request.form.get('payment_method', '').strip()
+        is_mobile_money = payment_method.lower() == 'mobile'
 
         if not shipping_name:
             user_doc = db.users.find_one({'email': current_user.email})
@@ -115,10 +124,11 @@ def checkout():
             })
             total_amount += price * qty
 
-            try:
-                db.products.update_one({'_id': product_data.get('_id')}, {'$inc': {'quantity': -qty}})
-            except Exception:
-                pass
+            if not is_mobile_money:
+                try:
+                    db.products.update_one({'_id': product_data.get('_id')}, {'$inc': {'quantity': -qty}})
+                except Exception:
+                    pass
 
         if not order_items:
             flash('Unable to place order. Please try again.', 'error')
@@ -137,11 +147,58 @@ def checkout():
             'shipping_phone': shipping_phone,
             'shipping_address': shipping_address,
             'payment_method': payment_method,
+            'payment_status': 'pending' if is_mobile_money else 'unpaid',
+            'payment_provider': 'paymongo' if is_mobile_money else None,
+            'payment_channel': 'gcash' if is_mobile_money else None,
             'created_at': datetime.utcnow(),
             'updated_at': datetime.utcnow(),
         })
 
-        # Send receipt email
+        if is_mobile_money:
+            success_url, cancel_url = _get_paymongo_redirect_urls()
+            try:
+                line_items = [
+                    {
+                        'name': item.get('name', 'Item'),
+                        'quantity': int(item.get('quantity', 1)),
+                        'amount': int(round(float(item.get('price', 0) or 0) * 100)),
+                        'currency': 'PHP',
+                    }
+                    for item in order_items
+                ]
+                checkout = create_checkout_session(
+                    amount=int(round(total_amount * 100)),
+                    description=f'FarmtoClick Order {order_result.inserted_id}',
+                    success_url=success_url,
+                    cancel_url=cancel_url,
+                    payment_method_types=['gcash', 'qrph'],
+                    line_items=line_items,
+                    metadata={'order_id': str(order_result.inserted_id), 'user_id': str(current_user.id)},
+                    reference_number=str(order_result.inserted_id),
+                )
+                db.orders.update_one(
+                    {'_id': order_result.inserted_id},
+                    {'$set': {
+                        'paymongo_checkout_id': checkout['id'],
+                        'paymongo_checkout_url': checkout['checkout_url'],
+                        'payment_status': 'pending',
+                        'payment_provider': 'paymongo',
+                        'updated_at': datetime.utcnow(),
+                    }},
+                )
+                return redirect(checkout['checkout_url'])
+            except PayMongoError as exc:
+                db.orders.update_one(
+                    {'_id': order_result.inserted_id},
+                    {'$set': {
+                        'payment_status': 'failed',
+                        'payment_error': str(exc),
+                        'updated_at': datetime.utcnow(),
+                    }},
+                )
+                flash('Unable to initialize mobile money payment.', 'error')
+                return redirect(url_for('cart.cart'))
+
         try:
             oid = str(order_result.inserted_id)
             receipt_pdf = generate_receipt_pdf(oid, shipping_name, current_user.email, order_items, total_amount)
